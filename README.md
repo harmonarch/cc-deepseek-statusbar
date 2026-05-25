@@ -30,13 +30,13 @@ deepseek-v4-pro  think:high  ████░░░░░░ 42%  12.5K · 2,343.
 ## 一键安装
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/YOUR_USER/cc-deepseek-statusbar/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/harmonarch/cc-deepseek-statusbar/main/install.sh | bash
 ```
 
 或者克隆后本地安装：
 
 ```bash
-git clone https://github.com/YOUR_USER/cc-deepseek-statusbar.git
+git clone https://github.com/harmonarch/cc-deepseek-statusbar.git
 cd cc-deepseek-statusbar
 bash install.sh
 ```
