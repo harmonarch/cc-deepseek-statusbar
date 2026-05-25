@@ -3,33 +3,11 @@
 # Display updates every 5s; token tracking runs every call for accuracy.
 set -euo pipefail
 
-DISPLAY_CACHE="/tmp/claude-deepseek/display_cache"
-CACHE_TTL=5
+AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-}"
+BALANCE_FILE="/tmp/claude-deepseek/balance_cache.json"
 
-input=$(cat)
-
-# ── Parse all fields in one jq call ──────────────────────────────────
-parsed=$(echo "$input" | jq -r '[
-  .model.id // "",
-  .model.display_name // .model.id // "?",
-  .session_id // "unknown",
-  .workspace.current_dir // "",
-  (.context_window.used_percentage // empty),
-  (.effort.level // empty),
-  (.thinking.enabled // empty),
-  (.cost.total_api_duration_ms // 0),
-  (.context_window.current_usage.input_tokens // 0),
-  (.context_window.current_usage.output_tokens // 0),
-  (.context_window.current_usage.cache_read_input_tokens // 0),
-  (.context_window.current_usage.cache_creation_input_tokens // 0),
-  (.context_window.total_input_tokens // 0),
-  (.context_window.total_output_tokens // 0),
-  (.context_window.context_window_size // 0)
-] | @tsv')
-
-IFS=$'\t' read -r model_id model_name session_id cwd used_pct effort thinking_enabled \
-     api_duration input_tokens output_tokens cache_read cache_write \
-     ctx_total_in ctx_total_out ctx_size <<< "$parsed"
+# Ensure required directories always exist (before any conditional blocks)
+mkdir -p /tmp/claude-deepseek
 
 # ── ANSI colors ──────────────────────────────────────────────────────
 GREEN=$'\033[0;32m'
@@ -40,6 +18,35 @@ MAGENTA=$'\033[0;35m'
 DIM=$'\033[2m'
 RESET=$'\033[0m'
 
+read_cached_balance() {
+  if [ -f "$BALANCE_FILE" ]; then
+    jq -r '.total_balance // "unknown"' "$BALANCE_FILE" 2>/dev/null || echo "unknown"
+  else
+    echo "unknown"
+  fi
+}
+
+format_balance_piece() {
+  local balance=$1
+  if [ "$balance" = "unknown" ] || [ "$balance" = "null" ] || [ -z "$balance" ]; then
+    printf "%s" "${DIM}¥...${RESET}"
+  else
+    printf "%s" "${GREEN}¥${balance}${RESET}"
+  fi
+}
+
+print_status_line() {
+  local first_line=$1
+  local second_line=${2:-}
+
+  if [ -z "$second_line" ]; then
+    printf "%s" "$first_line"
+    return 0
+  fi
+
+  printf "%s\n%s" "$first_line" "$second_line"
+}
+
 choose_color() {
   local pct=$1
   if   [ "$pct" -le 40 ]; then echo "$GREEN"
@@ -48,10 +55,77 @@ choose_color() {
   fi
 }
 
+refresh_balance_async() {
+  [ -n "$AUTH_TOKEN" ] || return 0
+  (
+    result=$(curl -s -L --connect-timeout 3 --max-time 10 -X GET 'https://api.deepseek.com/user/balance' \
+      -H 'Accept: application/json' \
+      -H "Authorization: Bearer ${AUTH_TOKEN}" 2>/dev/null || true)
+    fetched_balance=$(echo "$result" | jq -r '.balance_infos[0].total_balance // "unknown"' 2>/dev/null || echo "unknown")
+    if [ -n "$fetched_balance" ] && [ "$fetched_balance" != "unknown" ] && [ "$fetched_balance" != "null" ]; then
+      echo "{\"total_balance\":\"$fetched_balance\",\"updated_at\":$(date +%s)}" > "$BALANCE_FILE"
+    fi
+  ) >/dev/null 2>&1 &
+}
+
+# Non-blocking stdin read with a short timeout to prevent hanging at startup
+# when Claude Code hasn't sent data yet. Falls back gracefully if python3 is unavailable.
+if command -v python3 &>/dev/null; then
+  input=$(python3 -c "
+import sys, select
+ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+if ready:
+    sys.stdout.write(sys.stdin.read())
+" 2>/dev/null || true)
+else
+  # bash fallback: read with 0 timeout (non-blocking test)
+  if read -r -t 0 first_line 2>/dev/null; then
+    input="${first_line}$(cat 2>/dev/null || true)"
+  else
+    input=""
+  fi
+fi
+
+# Handle empty input at startup — show placeholder instead of hiding status bar
+if [ -z "$input" ]; then
+  startup_balance=$(read_cached_balance)
+  if [ "$startup_balance" = "unknown" ] || [ "$startup_balance" = "null" ] || [ -z "$startup_balance" ]; then
+    refresh_balance_async
+  fi
+  left_output="${CYAN}Claude Code${RESET}  ${DIM}waiting for session data${RESET}"
+  second_output="${DIM}tokens: --${RESET} · $(format_balance_piece "$startup_balance")"
+  print_status_line "$left_output" "$second_output"
+  exit 0
+fi
+
+# ── Parse all fields in one jq call ──────────────────────────────────
+parsed=$(echo "$input" | jq -r '[
+  .model.id // "",
+  .model.display_name // .model.id // "?",
+  .session_id // "unknown",
+  .workspace.current_dir // "",
+  (.context_window.used_percentage // ""),
+  (.effort.level // ""),
+  (.thinking.enabled // ""),
+  (.cost.total_api_duration_ms // 0),
+  (.context_window.current_usage.input_tokens // 0),
+  (.context_window.current_usage.output_tokens // 0),
+  (.context_window.current_usage.cache_read_input_tokens // 0),
+  (.context_window.current_usage.cache_creation_input_tokens // 0),
+  (.context_window.total_input_tokens // 0),
+  (.context_window.total_output_tokens // 0),
+  (.context_window.context_window_size // 0)
+] | join("\u001f")')
+
+IFS=$'\037' read -r model_id model_name session_id cwd used_pct effort thinking_enabled \
+     api_duration input_tokens output_tokens cache_read cache_write \
+     ctx_total_in ctx_total_out ctx_size <<< "$parsed"
+
 # ══════════════════════════════════════════════════════════════════════
 # Deepseek token tracking (ALWAYS runs - must be accurate)
 # ══════════════════════════════════════════════════════════════════════
 TRACKING_UPDATED=false
+IS_IDLE=false
 
 if [[ "$model_id" == deepseek-* ]]; then
   STATE_DIR="/tmp/claude-deepseek"
@@ -64,7 +138,6 @@ if [[ "$model_id" == deepseek-* ]]; then
   today=$(date +%Y-%m-%d)
   SESSION_FILE="${STATE_DIR}/session_${session_id}.json"
   DAILY_FILE="${STATE_DIR}/daily_${today}.json"
-  BALANCE_FILE="${STATE_DIR}/balance_cache.json"
 
   calc_cost() {
     local in=$1 out=$2 cread=$3 cwrite=$4
@@ -130,17 +203,14 @@ if [[ "$model_id" == deepseek-* ]]; then
       '{daily_in: $di, daily_out: $do, daily_cread: $dcr, daily_cwrite: $dcw, daily_cost: $dc}' \
       > "$DAILY_FILE"
   fi
-fi
 
-# ══════════════════════════════════════════════════════════════════════
-# Display cache check (AFTER tracking is done)
-# ══════════════════════════════════════════════════════════════════════
-if [ -f "$DISPLAY_CACHE" ] && [ "$TRACKING_UPDATED" = "false" ]; then
-  cache_time=$(stat -f %m "$DISPLAY_CACHE" 2>/dev/null || echo 0)
-  now=$(date +%s)
-  if [ $((now - cache_time)) -lt $CACHE_TTL ]; then
-    cat "$DISPLAY_CACHE"
-    exit 0
+  # Determine idle: no session tokens AND no API calls made yet
+  sess_total_idle=0
+  if [ -f "$SESSION_FILE" ]; then
+    sess_total_idle=$(jq -r '[.session_in, .session_out, .session_cread, .session_cwrite] | add // 0' "$SESSION_FILE" 2>/dev/null || echo 0)
+  fi
+  if [ "$sess_total_idle" -eq 0 ] 2>/dev/null && [ "$api_duration" -eq 0 ] 2>/dev/null; then
+    IS_IDLE=true
   fi
 fi
 
@@ -192,12 +262,12 @@ if [ -n "$cwd" ]; then
 fi
 
 # Deepseek balance display
-deepseek_str=""
+token_str=""
+balance_str=""
 if [[ "$model_id" == deepseek-* ]]; then
   STATE_DIR="/tmp/claude-deepseek"
   SESSION_FILE="${STATE_DIR}/session_${session_id}.json"
   DAILY_FILE="${STATE_DIR}/daily_$(date +%Y-%m-%d).json"
-  BALANCE_FILE="${STATE_DIR}/balance_cache.json"
 
   # Read session token totals
   sess_total=0
@@ -236,27 +306,31 @@ if [[ "$model_id" == deepseek-* ]]; then
     daily_k="${daily_total}"
   fi
 
-  # Balance cache (refresh if older than 90s, background)
-  balance="?"
+  # Balance fetch (strategy depends on idle vs active state)
+  balance="unknown"
   if [ -f "$BALANCE_FILE" ]; then
-    balance=$(jq -r '.total_balance // "?"' "$BALANCE_FILE" 2>/dev/null || echo "?")
+    balance=$(jq -r '.total_balance // "unknown"' "$BALANCE_FILE" 2>/dev/null || echo "unknown")
     cache_age=$(($(date +%s) - $(stat -f %m "$BALANCE_FILE" 2>/dev/null || echo 0)))
     if [ "$cache_age" -gt 90 ]; then
-      (curl -s -L -X GET 'https://api.deepseek.com/user/balance' \
-        -H 'Accept: application/json' \
-        -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}" 2>/dev/null | \
-        jq -c '{total_balance: (.balance_infos[0].total_balance // "?"), updated_at: now}' \
-        > "$BALANCE_FILE" 2>/dev/null) &
+      refresh_balance_async
     fi
   else
-    result=$(curl -s -L -X GET 'https://api.deepseek.com/user/balance' \
-      -H 'Accept: application/json' \
-      -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}" 2>/dev/null)
-    balance=$(echo "$result" | jq -r '.balance_infos[0].total_balance // "?"' 2>/dev/null || echo "?")
-    echo "{\"total_balance\":\"$balance\",\"updated_at\":$(date +%s)}" > "$BALANCE_FILE"
+    refresh_balance_async
+    balance="unknown"
   fi
 
-  deepseek_str="${MAGENTA}${sess_k}${RESET} · ${DIM}${daily_k}${RESET} · ${GREEN}¥${balance}${RESET}"
+  balance_ready=false
+  if [ "$balance" != "unknown" ] && [ "$balance" != "null" ] && [ -n "$balance" ]; then
+    balance_ready=true
+  fi
+
+  if [ "$IS_IDLE" = "true" ]; then
+    token_str="${DIM}tokens: 0 · today ${daily_k}${RESET}"
+    balance_str="$(format_balance_piece "$balance")"
+  else
+    token_str="${MAGENTA}${sess_k}${RESET} · ${DIM}${daily_k}${RESET}"
+    balance_str="$(format_balance_piece "$balance")"
+  fi
 fi
 
 # ── Assemble ─────────────────────────────────────────────────────────
@@ -264,7 +338,6 @@ pieces=()
 pieces+=("${CYAN}${model_name}${RESET}")
 [ -n "$think_str" ] && pieces+=("$think_str")
 pieces+=("$context_str")
-[ -n "$deepseek_str" ] && pieces+=("$deepseek_str")
 pieces+=("${CYAN}${dir_display}${RESET}")
 
 output=""
@@ -278,4 +351,14 @@ for piece in "${pieces[@]}"; do
   fi
 done
 
-printf "%s" "$output" | tee "$DISPLAY_CACHE"
+second_line=""
+if [ -n "$token_str" ] && [ -n "$balance_str" ]; then
+  second_line="${token_str} · ${balance_str}"
+elif [ -n "$token_str" ]; then
+  second_line="$token_str"
+elif [ -n "$balance_str" ]; then
+  second_line="$balance_str"
+fi
+
+final_output=$(print_status_line "$output" "$second_line")
+printf "%s" "$final_output"
