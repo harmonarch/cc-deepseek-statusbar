@@ -15,6 +15,8 @@ YELLOW=$'\033[0;33m'
 RED=$'\033[0;31m'
 CYAN=$'\033[0;36m'
 MAGENTA=$'\033[0;35m'
+LIGHT_PURPLE=$'\033[38;5;183m'
+PINK=$'\033[38;5;205m'
 DIM=$'\033[2m'
 RESET=$'\033[0m'
 
@@ -93,7 +95,7 @@ if [ -z "$input" ]; then
     refresh_balance_async
   fi
   left_output="${CYAN}Claude Code${RESET}  ${DIM}waiting for session data${RESET}"
-  second_output="${DIM}tokens: --${RESET} · $(format_balance_piece "$startup_balance")"
+  second_output="${LIGHT_PURPLE}--${RESET} · ${PINK}--${RESET} · $(format_balance_piece "$startup_balance")"
   print_status_line "$left_output" "$second_output"
   exit 0
 fi
@@ -222,17 +224,17 @@ fi
 context_str=""
 if [ -n "$used_pct" ]; then
   used_int=$(printf "%.0f" "$used_pct")
-  clr=$(choose_color "$used_int")
-  filled=$(( used_int * 10 / 100 ))
-  [ "$filled" -gt 10 ] && filled=10
-  empty=$(( 10 - filled ))
-  bar=""
-  for ((i=0; i<filled; i++)); do bar+="█"; done
-  for ((i=0; i<empty;  i++)); do bar+="░"; done
-  context_str="${clr}${bar} ${used_int}%${RESET}"
 else
-  context_str="${DIM}(no data)${RESET}"
+  used_int=0
 fi
+clr=$(choose_color "$used_int")
+filled=$(( used_int * 10 / 100 ))
+[ "$filled" -gt 10 ] && filled=10
+empty=$(( 10 - filled ))
+bar=""
+for ((i=0; i<filled; i++)); do bar+="█"; done
+for ((i=0; i<empty;  i++)); do bar+="░"; done
+context_str="${clr}${bar} ${used_int}%${RESET}"
 
 # Thinking / effort
 think_str=""
@@ -325,10 +327,10 @@ if [[ "$model_id" == deepseek-* ]]; then
   fi
 
   if [ "$IS_IDLE" = "true" ]; then
-    token_str="${DIM}tokens: 0 · today ${daily_k}${RESET}"
+    token_str="${LIGHT_PURPLE}0${RESET} · ${PINK}${daily_k}${RESET}"
     balance_str="$(format_balance_piece "$balance")"
   else
-    token_str="${MAGENTA}${sess_k}${RESET} · ${DIM}${daily_k}${RESET}"
+    token_str="${LIGHT_PURPLE}${sess_k}${RESET} · ${PINK}${daily_k}${RESET}"
     balance_str="$(format_balance_piece "$balance")"
   fi
 fi
